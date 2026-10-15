@@ -1,0 +1,232 @@
+"""Агент: диалог с Gemini + ручной цикл вызова инструментов.
+
+Схемы инструментов передаются как Function Declarations (без callables),
+поэтому SDK сам отключает automatic function calling, и мы обрабатываем
+вызовы вручную — это нужно для подтверждений и безопасности.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Protocol
+
+from google import genai
+from google.genai import types
+
+from .config import Config
+from .prompts import SYSTEM_PROMPT
+from .tools import AUTO_TOOLS, TOOL_SCHEMAS, ToolBox
+
+MAX_TOOL_ROUNDS = 25  # максимум итераций «модель → инструменты → модель» за один ход
+
+
+class UI(Protocol):
+    """Интерфейс, который реализует CLI (или тесты)."""
+
+    def on_text_delta(self, text: str) -> None: ...
+
+    def on_tool_start(self, name: str, summary: str, dangerous: bool) -> None: ...
+
+    def on_tool_result(self, name: str, status: str, preview: str) -> None: ...
+
+    def on_info(self, message: str) -> None: ...
+
+    def confirm(self, name: str, summary: str, dangerous: bool) -> str:
+        """Вернуть: 'yes' | 'no' | 'always'."""
+        ...
+
+    def ask_text(self, question: str) -> str:
+        """Спросить текст у пользователя (инструмент ask_user)."""
+        ...
+
+
+class NullUI:
+    def on_text_delta(self, text: str) -> None:
+        print(text, end="", flush=True)
+
+    def on_tool_start(self, name: str, summary: str, dangerous: bool) -> None:
+        pass
+
+    def on_tool_result(self, name: str, status: str, preview: str) -> None:
+        pass
+
+    def on_info(self, message: str) -> None:
+        print(f"\n[{message}]")
+
+    def confirm(self, name: str, summary: str, dangerous: bool) -> str:
+        return "no"
+
+    def ask_text(self, question: str) -> str:
+        return ""
+
+
+class AgentError(RuntimeError):
+    pass
+
+
+def _fc_schemas() -> list[types.FunctionDeclaration]:
+    return [
+        types.FunctionDeclaration(
+            name=s["name"],
+            description=s["description"],
+            parameters=s["parameters"],
+        )
+        for s in TOOL_SCHEMAS
+    ]
+
+
+def _preview(result: dict, limit: int = 1500) -> str:
+    try:
+        text = json.dumps(result, ensure_ascii=False, indent=1)
+    except Exception:  # noqa: BLE001
+        text = str(result)
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
+class Agent:
+    def __init__(self, config: Config, ui: UI | None = None):
+        self.config = config
+        self.ui = ui or NullUI()
+        api_key = config.resolve_api_key()
+        if not api_key:
+            raise AgentError(
+                "Не найден API-ключ Gemini. Задайте GEMINI_API_KEY=... или выполните /key в REPL."
+            )
+        self.client = genai.Client(api_key=api_key)
+        self.workspace = Path(config.workspace or Path.cwd()).expanduser().resolve()
+        self.auto_approve = config.auto_approve
+        self.web_search = config.web_search
+        self._always_ok: set[str] = set()
+        self.chat = None
+        self._history: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Чат
+    # ------------------------------------------------------------------
+    def _build_chat(self) -> None:
+        tools: list[types.ToolUnion] = [types.Tool(function_declarations=_fc_schemas())]
+        if self.web_search:
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+        cfg = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=tools,
+            temperature=self.config.temperature,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        self.chat = self.client.chats.create(
+            model=self.config.model,
+            config=cfg,
+            history=self._history or None,
+        )
+
+    def clear(self) -> None:
+        self._history = []
+        self.chat = None
+
+    def send(self, user_text: str) -> None:
+        """Один пользовательский ход: стриминг текста + цикл инструментов."""
+        if self.chat is None:
+            self._build_chat()
+
+        message: Any = user_text
+        for _round in range(MAX_TOOL_ROUNDS):
+            text_parts: list[str] = []
+            calls: list[types.FunctionCall] = []
+
+            stream = self.chat.send_message_stream(message)
+            for chunk in stream:
+                candidate = (chunk.candidates or [None])[0]
+                if candidate is None or candidate.content is None:
+                    continue
+                for part in candidate.content.parts or []:
+                    if part is None:
+                        continue
+                    if getattr(part, "thought", False):
+                        continue  # скрытые «мысли» не показываем
+                    if part.text:
+                        text_parts.append(part.text)
+                        self.ui.on_text_delta(part.text)
+                    if part.function_call:
+                        calls.append(part.function_call)
+
+            if not calls:
+                if text_parts:
+                    self.ui.on_text_delta("\n")
+                return
+
+            # Выполняем все вызовы инструментов этого раунда
+            responses: list[types.Part] = []
+            for call in calls:
+                name = call.name or ""
+                args = dict(call.args or {})
+                result = self._execute_tool(name, args)
+                responses.append(
+                    types.Part.from_function_response(name=name, response=result)
+                )
+            message = responses
+
+        self.ui.on_info(f"достигнут лимит в {MAX_TOOL_ROUNDS} раундов инструментов")
+
+    # ------------------------------------------------------------------
+    # Инструменты
+    # ------------------------------------------------------------------
+    def _execute_tool(self, name: str, args: dict) -> dict:
+        summary = ToolBox.summary(name, args)
+        dangerous = ToolBox.is_dangerous(name, args)
+
+        # Логика подтверждения:
+        #  - read-only (AUTO_TOOLS) — без вопроса;
+        #  - опасные — всегда спрашиваем (даже в auto_approve);
+        #  - остальные — спрашиваем, пока пользователь не разрешил (always / --yes).
+        if name in AUTO_TOOLS:
+            allowed = True
+        elif dangerous:
+            self.ui.on_tool_start(name, summary, True)
+            answer = self.ui.confirm(name, summary, True)
+            allowed = answer in ("yes", "always")
+        elif name in self._always_ok or self.auto_approve:
+            allowed = True
+            self.ui.on_tool_start(name, summary, False)
+        else:
+            self.ui.on_tool_start(name, summary, False)
+            answer = self.ui.confirm(name, summary, False)
+            allowed = answer in ("yes", "always")
+            if answer == "always":
+                self._always_ok.add(name)
+
+        if not allowed:
+            self.ui.on_tool_result(name, "denied", "пользователь запретил выполнение")
+            return {"status": "error", "error": "пользователь запретил выполнение этого действия"}
+
+        box = ToolBox(
+            workspace=self.workspace,
+            ask=self.ui.ask_text,
+            default_timeout=self.config.command_timeout,
+        )
+        result = box.dispatch(name, args)
+        status = str(result.get("status", "ok"))
+        self.ui.on_tool_result(name, status, _preview(result))
+        return result
+
+
+def friendly_error(exc: Exception) -> str:
+    """Человекочитаемая подсказка для типичных ошибок API."""
+    text = str(exc)
+    low = text.lower()
+    if "api key" in low or "401" in low or "unauthenticated" in low or "permission" in low and "key" in low:
+        return (
+            "Ошибка авторизации: API-ключ не принят. Проверьте GEMINI_API_KEY "
+            "или создайте ключ на https://aistudio.google.com/apikey"
+        )
+    if "429" in low or "quota" in low or "resource has been exhausted" in low:
+        return "Превышена квота API (429). Подождите или смените модель/ключ."
+    if "503" in low or "500" in low or "unavailable" in low or "deadline" in low:
+        return "Сервис Gemini временно недоступен. Повторите попытку чуть позже."
+    if "not found" in low and "model" in low:
+        return f"Модель не найдена: {text}. Проверьте имя модели (/model) — например, gemini-2.5-flash."
+    if any(s in low for s in ("tls", "ssl", "connection", "network", "resolve", "timed out", "eof")):
+        return (
+            "Сетевая ошибка при обращении к API Gemini. Проверьте подключение к интернету "
+            "и доступность generativelanguage.googleapis.com (прокси/файрвол/VPN)."
+        )
+    return f"Ошибка API: {text}"
