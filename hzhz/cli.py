@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import sys
 from pathlib import Path
@@ -37,15 +38,21 @@ HELP = """\
 [cyan]/help[/]     — эта справка
 [cyan]/clear[/]    — очистить историю диалога
 [cyan]/model[/]    — показать или сменить модель (/model gemini-2.5-pro)
-[cyan]/auto[/]     — вкл/выкл авто-подтверждение инструментов (опасные всё равно спрашиваем)
+[cyan]/auto[/]     — вкл/выкл авто-подтверждение инструментов (опасные всё равно заблокированы!)
+[cyan]/danger[/]   — разблокировать/заблокировать опасные команды на время сессии (как флаг --danger)
+[cyan]/password[/] — задать или сбросить пароль опасных команд (/password clear)
 [cyan]/search[/]   — вкл/выкл Google Search (веб-поиск)
 [cyan]/tools[/]    — список инструментов агента
 [cyan]/key[/]      — сохранить API-ключ (в ~/.config/hzhz/config.json, chmod 600)
 [cyan]/save[/]     — сохранить диалог в markdown (/save chat.md)
 [cyan]/quit[/]     — выход
 
-Обычный текст = сообщение агенту. Инструменты (команды, файлы) спрашивают
+Обычный текст = сообщение агенту. Инструменты (запись файлов) спрашивают
 подтверждение: [ok]y[/] — да, [ok]n[/] — нет, [ok]a[/] — да и больше не спрашивать.
+
+[danger bold]Опасные команды[/] (rm -rf, dd, pacman -R, curl|sh, systemctl …) заблокированы
+и выполняются ТОЛЬКО после разблокировки: флаг [ok]--danger[/] / [ok]/danger[/]
+либо пароль опасных команд ([ok]/password[/]). /auto и --yes защиту не обходят.
 """
 
 
@@ -102,6 +109,40 @@ class ConsoleUI:
             self.console.print()
             return ""
 
+    def ask_password(self, prompt: str) -> str:
+        self.console.print("[danger]⚠ Требуется пароль опасных команд[/]")
+        try:
+            return getpass.getpass(prompt)
+        except (KeyboardInterrupt, EOFError):
+            self.console.print()
+            return ""
+        except Exception:  # noqa: BLE001  # не-TTY окружение
+            try:
+                return Prompt.ask(prompt, password=True)
+            except (KeyboardInterrupt, EOFError):
+                self.console.print()
+                return ""
+
+
+def _set_password_interactive(cfg: Config, console: Console) -> bool:
+    """Запросить новый пароль опасных команд дважды и сохранить. True — успех."""
+    try:
+        p1 = getpass.getpass("Новый пароль опасных команд: ")
+        p2 = getpass.getpass("Повторите пароль: ")
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[info]отменено[/]")
+        return False
+    if not p1:
+        console.print("[info]Пустой пароль — отмена.[/]")
+        return False
+    if p1 != p2:
+        console.print("[danger]Пароли не совпадают.[/]")
+        return False
+    cfg.set_danger_password(p1)
+    path = cfg.save()
+    console.print(f"[ok]Пароль опасных команд задан и сохранён в {path}[/]")
+    return True
+
 
 def _print_error(console: Console, exc: Exception) -> None:
     msg = friendly_error(exc) if not isinstance(exc, AgentError) else str(exc)
@@ -110,6 +151,10 @@ def _print_error(console: Console, exc: Exception) -> None:
 
 def _repl(agent: Agent, console: Console, cfg: Config) -> int:
     console.print(BANNER)
+    if agent.danger_enabled:
+        console.print("[danger]⚠ Опасные команды РАЗБЛОКИРОВАНЫ флагом --danger[/]")
+    else:
+        console.print("[info]Опасные команды заблокированы ( --danger / /danger / пароль )[/]")
     if not agent.auto_approve:
         console.print("[info]Подтверждение действий включено ( /auto — авто-режим )[/]\n")
     transcript: list[str] = []
@@ -148,6 +193,28 @@ def _repl(agent: Agent, console: Console, cfg: Config) -> int:
                 agent.auto_approve = not agent.auto_approve
                 state = "вкл" if agent.auto_approve else "выкл"
                 console.print(f"[ok]Авто-подтверждение: {state}[/]")
+            elif cmd == "/danger":
+                agent.danger_enabled = not agent.danger_enabled
+                state = "[danger]РАЗБЛОКИРОВАНЫ[/]" if agent.danger_enabled else "[ok]заблокированы[/]"
+                console.print(f"Опасные команды: {state} (до конца сессии)")
+            elif cmd == "/password":
+                if rest.strip().lower() in ("clear", "сброс", "--clear"):
+                    cfg.clear_danger_password()
+                    cfg.save()
+                    console.print("[ok]Пароль опасных команд удалён. Теперь опасные команды доступны только через --danger / /danger[/]")
+                elif cfg.has_danger_password():
+                    # смена пароля требует знания старого
+                    try:
+                        old = getpass.getpass("Текущий пароль: ")
+                    except (KeyboardInterrupt, EOFError):
+                        console.print("\n[info]отменено[/]")
+                        old = ""
+                    if not cfg.verify_danger_password(old):
+                        console.print("[danger]Неверный пароль — смена отменена.[/]")
+                    else:
+                        _set_password_interactive(cfg, console)
+                else:
+                    _set_password_interactive(cfg, console)
             elif cmd == "/search":
                 agent.web_search = not agent.web_search
                 agent.clear()
@@ -208,7 +275,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-p", "--oneshot", action="store_true", help="одноразовый режим: ответить и выйти")
     parser.add_argument("-m", "--model", help=f"модель (по умолчанию {DEFAULT_MODEL})")
     parser.add_argument("-w", "--workspace", help="рабочая директория для команд (по умолчанию — текущая)")
-    parser.add_argument("-y", "--yes", action="store_true", help="авто-подтверждать инструменты (опасные — всё равно спрашивать)")
+    parser.add_argument("-y", "--yes", action="store_true", help="авто-подтверждать инструменты (опасные команды всё равно требуют --danger или пароль)")
+    parser.add_argument("--danger", action="store_true", help="разблокировать опасные команды на время сессии (rm -rf, dd, pacman -R …)")
+    parser.add_argument("--set-password", action="store_true", help="задать/сменить пароль опасных команд и выйти")
     parser.add_argument("--search", action="store_true", help="включить Google Search (веб-поиск)")
     parser.add_argument("--key", help="API-ключ Gemini (или GEMINI_API_KEY)")
     parser.add_argument("--no-color", action="store_true", help="без цвета")
@@ -217,6 +286,10 @@ def main(argv: list[str] | None = None) -> int:
 
     console = Console(no_color=args.no_color, theme=THEME)
     cfg = load_config()
+
+    if args.set_password:
+        return 0 if _set_password_interactive(cfg, console) else 1
+
     if args.key:
         cfg.api_key = args.key
     if args.model:
@@ -229,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.web_search = True
 
     try:
-        agent = Agent(cfg, ui=ConsoleUI(console))
+        agent = Agent(cfg, ui=ConsoleUI(console), danger_enabled=args.danger)
     except AgentError as exc:
         console.print(f"[danger]✗ {exc}[/]")
         console.print(
@@ -244,7 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         if not text:
             parser.error("в режиме -p нужно передать текст запроса")
         if not cfg.auto_approve:
-            console.print("[info]Одноразовый режим без --yes: инструменты с записью/командами будут запрещены.[/]")
+            console.print("[info]Одноразовый режим без --yes: инструменты с записью/командами будут запрещены. "
+                          "Опасные команды требуют --danger или пароль.[/]")
         return _oneshot(agent, console, text)
     return _repl(agent, console, cfg)
 

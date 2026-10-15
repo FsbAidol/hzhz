@@ -39,6 +39,10 @@ class UI(Protocol):
         """Спросить текст у пользователя (инструмент ask_user)."""
         ...
 
+    def ask_password(self, prompt: str) -> str:
+        """Скрыто ввести пароль опасных команд."""
+        ...
+
 
 class NullUI:
     def on_text_delta(self, text: str) -> None:
@@ -57,6 +61,9 @@ class NullUI:
         return "no"
 
     def ask_text(self, question: str) -> str:
+        return ""
+
+    def ask_password(self, prompt: str) -> str:
         return ""
 
 
@@ -84,7 +91,7 @@ def _preview(result: dict, limit: int = 1500) -> str:
 
 
 class Agent:
-    def __init__(self, config: Config, ui: UI | None = None):
+    def __init__(self, config: Config, ui: UI | None = None, danger_enabled: bool = False):
         self.config = config
         self.ui = ui or NullUI()
         api_key = config.resolve_api_key()
@@ -96,7 +103,11 @@ class Agent:
         self.workspace = Path(config.workspace or Path.cwd()).expanduser().resolve()
         self.auto_approve = config.auto_approve
         self.web_search = config.web_search
+        # Разблокировка опасных команд: флаг --danger (или /danger).
+        # Пароль (/password) разблокирует одно действие; флаг — всю сессию.
+        self.danger_enabled = danger_enabled
         self._always_ok: set[str] = set()
+        self._always_danger_ok = False
         self.chat = None
         self._history: list[dict] = []
 
@@ -174,16 +185,18 @@ class Agent:
         summary = ToolBox.summary(name, args)
         dangerous = ToolBox.is_dangerous(name, args)
 
-        # Логика подтверждения:
+        # Логика допуска:
         #  - read-only (AUTO_TOOLS) — без вопроса;
-        #  - опасные — всегда спрашиваем (даже в auto_approve);
-        #  - остальные — спрашиваем, пока пользователь не разрешил (always / --yes).
-        if name in AUTO_TOOLS:
+        #  - ОПАСНЫЕ — заблокированы по умолчанию: нужны флаг --danger (/danger)
+        #    ИЛИ верный пароль опасных команд (/password). Обычное y — недостаточно.
+        #  - остальные (запись/команды) — спрашиваем, пока пользователь не разрешил.
+        if dangerous:
+            allowed, deny_reason = self._danger_gate(name, summary)
+            if not allowed:
+                self.ui.on_tool_result(name, "denied", deny_reason)
+                return {"status": "error", "error": deny_reason}
+        elif name in AUTO_TOOLS:
             allowed = True
-        elif dangerous:
-            self.ui.on_tool_start(name, summary, True)
-            answer = self.ui.confirm(name, summary, True)
-            allowed = answer in ("yes", "always")
         elif name in self._always_ok or self.auto_approve:
             allowed = True
             self.ui.on_tool_start(name, summary, False)
@@ -207,6 +220,45 @@ class Agent:
         status = str(result.get("status", "ok"))
         self.ui.on_tool_result(name, status, _preview(result))
         return result
+
+    def _danger_gate(self, name: str, summary: str) -> tuple[bool, str]:
+        """Пропуск опасного действия: только пароль или флаг --danger.
+
+        Возвращает (allowed, причина_отказа).
+        """
+        self.ui.on_tool_start(name, summary, True)
+
+        # Способ 1: флаг --danger / /danger — разблокирована вся сессия.
+        if self.danger_enabled:
+            if self.auto_approve or self._always_danger_ok:
+                return True, ""
+            answer = self.ui.confirm(name, summary, True)
+            if answer == "always":
+                self._always_danger_ok = True
+            return answer in ("yes", "always"), "пользователь запретил выполнение"
+
+        # Способ 2: пароль опасных команд — разблокирует это действие.
+        if self.config.has_danger_password():
+            password = self.ui.ask_password("Пароль опасных команд: ")
+            if not password:
+                return False, (
+                    "ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА: ввод пароля отменён. "
+                    "Действие не выполнено. Пользователь может разрешить опасные команды "
+                    "флагом --danger (или командой /danger) либо повторить и ввести пароль."
+                )
+            if self.config.verify_danger_password(password):
+                return True, ""
+            return False, (
+                "ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА: неверный пароль. "
+                "Действие не выполнено. Не пытайся обойти защиту."
+            )
+
+        return False, (
+            "ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА: опасные команды запрещены без разблокировки. "
+            "Пользователь должен либо запустить hzhz с флагом --danger (или выполнить /danger), "
+            "либо задать пароль опасных команд командой /password — после чего повторить действие. "
+            "Не пытайся обойти защиту."
+        )
 
 
 def friendly_error(exc: Exception) -> str:
