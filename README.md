@@ -32,13 +32,22 @@ hzhz ▸ В проекте Python, ставлю зависимости чере�
 ## Установка (CachyOS / Arch Linux)
 
 ```bash
-git clone <этот-репозиторий> hzhz
+git clone https://github.com/FsbAidol/hzhz.git hzhz
 cd hzhz
 ./install.sh
 ```
 
+> ⚠️ URL должен заканчиваться на `.git` — это адрес git-репозитория, а не веб-страницы
+> (`…/tree/…` — неправильно). Скобки `<>` в команду не входят.
+
+> 🛡 Скрипт `install.sh` из этого репозитория **только** ставит hzhz: venv в
+> `~/.local/share/hzhz/venv` и команду `hzhz` в `~/.local/bin`. Он **не** устанавливает
+> пакеты, не трогает dotfiles, shell и системные настройки. Если вы видите надпись
+> `WARNING: This script is currently untested…` — это НЕ установщик hzhz (первые слова
+> нашего скрипта всегда: `==> hzhz: установка из …`).
+
 Скрипт создаст venv в `~/.local/share/hzhz/venv` и команду `hzhz` в `~/.local/bin`.
-Если `~/.local/bin` не в PATH — добавьте в `~/.bashrc` / `~/.zshrc`:
+Если `~/.local/bin` не в PATH — добавьте в `~/.bashrc` / `~/.zshrc` / `config.fish`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -209,5 +218,6 @@ hzhz -w ~/projects/myapp      # команды выполняются в ука�
 | `Модель не найдена` | проверьте имя: `/model gemini-2.5-flash` |
 | `sudo` не работает из агента | sudo требует TTY с паролем — выполните sudo-команду вручную |
 | `hzhz: command not found` | `export PATH="$HOME/.local/bin:$PATH"` |
+| `zsh: Нет такого файла…` при `git clone` | URL должен заканчиваться на `.git`, без `<>` и без `/tree/` — см. «Установка» |
 | «ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА» | так и должно быть: разблокируйте `--danger` / `/danger` или задайте пароль `/password` |
 | Забыли пароль опасных команд | `/password clear` — или удалите `danger_password_salt`/`danger_password_hash` из `~/.config/hzhz/config.json` |

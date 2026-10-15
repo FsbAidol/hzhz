@@ -3,6 +3,14 @@
 # Создаёт виртуальное окружение в ~/.local/share/hzhz/venv и команду `hzhz` в ~/.local/bin.
 set -euo pipefail
 
+echo "=============================================="
+echo " hzhz — установка терминального агента"
+echo " Это установщик hzhz. Он ТОЛЬКО создаёт:"
+echo "   • venv:      ~/.local/share/hzhz/venv"
+echo "   • команду:   ~/.local/bin/hzhz"
+echo " НЕ ставит пакеты, dotfiles, shell и т.п."
+echo "=============================================="
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/hzhz"
 VENV_DIR="$APP_DIR/venv"
