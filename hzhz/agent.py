@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,6 +15,7 @@ from google import genai
 from google.genai import types
 
 from .config import Config
+from .openrouter import ApiError, normalize_model, stream_chat, to_openai_tools
 from .prompts import SYSTEM_PROMPT
 from .tools import AUTO_TOOLS, TOOL_SCHEMAS, ToolBox
 
@@ -95,11 +97,39 @@ class Agent:
         self.config = config
         self.ui = ui or NullUI()
         api_key = config.resolve_api_key()
-        if not api_key:
-            raise AgentError(
-                "Не найден API-ключ Gemini. Задайте GEMINI_API_KEY=... или выполните /key в REPL."
-            )
-        self.client = genai.Client(api_key=api_key)
+        or_key = os.environ.get("OPENROUTER_API_KEY", "")
+        provider = (getattr(config, "provider", "") or "").lower()
+        if not provider:
+            if api_key.startswith("sk-or-") or (not api_key and or_key):
+                provider = "openrouter"
+            else:
+                provider = "gemini"
+        if provider not in ("gemini", "openrouter"):
+            raise AgentError(f"неизвестный провайдер: {provider} (доступны: gemini, openrouter)")
+        self.provider = provider
+        if provider == "openrouter":
+            if api_key and not api_key.startswith("sk-or-"):
+                api_key = ""  # ключ Gemini не подходит для OpenRouter
+            api_key = api_key or or_key
+            if not api_key:
+                raise AgentError(
+                    "Не найден API-ключ OpenRouter. Задайте OPENROUTER_API_KEY=sk-or-... "
+                    "или выполните /key sk-or-... в REPL. Ключ: https://openrouter.ai/keys"
+                )
+            self._or_key = api_key
+            self._or_model = normalize_model(config.model)
+            self._or_messages: list[dict] | None = None
+            self.client = None
+            self.chat = None
+            self._history: list[dict] = []
+        else:
+            if not api_key:
+                raise AgentError(
+                    "Не найден API-ключ Gemini. Задайте GEMINI_API_KEY=... или выполните /key в REPL."
+                )
+            self.client = genai.Client(api_key=api_key)
+            self.chat = None
+            self._history: list[dict] = []
         self.workspace = Path(config.workspace or Path.cwd()).expanduser().resolve()
         self.auto_approve = config.auto_approve
         self.web_search = config.web_search
@@ -133,9 +163,13 @@ class Agent:
     def clear(self) -> None:
         self._history = []
         self.chat = None
+        if self.provider == "openrouter":
+            self._or_messages = None
 
     def send(self, user_text: str) -> None:
         """Один пользовательский ход: стриминг текста + цикл инструментов."""
+        if self.provider == "openrouter":
+            return self._send_openrouter(user_text)
         if self.chat is None:
             self._build_chat()
 
@@ -175,6 +209,51 @@ class Agent:
                     types.Part.from_function_response(name=name, response=result)
                 )
             message = responses
+
+        self.ui.on_info(f"достигнут лимит в {MAX_TOOL_ROUNDS} раундов инструментов")
+
+    def _send_openrouter(self, user_text: str) -> None:
+        """Ход через OpenRouter (OpenAI-совместимый API)."""
+        if self._or_messages is None:
+            self._or_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._or_messages.append({"role": "user", "content": user_text})
+        tools = to_openai_tools(TOOL_SCHEMAS)
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            assistant_msg: dict | None = None
+            calls: list[tuple] = []
+            try:
+                for event in stream_chat(
+                    api_key=self._or_key,
+                    model=self._or_model,
+                    messages=self._or_messages,
+                    tools=tools,
+                    temperature=self.config.temperature,
+                ):
+                    if event[0] == "text":
+                        self.ui.on_text_delta(event[1])
+                    else:
+                        _, assistant_msg, calls = event
+            except ApiError as exc:
+                raise AgentError(friendly_error(exc)) from exc
+
+            if not calls:
+                if assistant_msg is not None:
+                    self._or_messages.append(assistant_msg)
+                self.ui.on_text_delta("\n")
+                return
+
+            if assistant_msg is not None:
+                self._or_messages.append(assistant_msg)
+            for call_id, name, args in calls:
+                result = self._execute_tool(name, args)
+                self._or_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
 
         self.ui.on_info(f"достигнут лимит в {MAX_TOOL_ROUNDS} раундов инструментов")
 
@@ -272,6 +351,11 @@ def friendly_error(exc: Exception) -> str:
         )
     if "429" in low or "quota" in low or "resource has been exhausted" in low:
         return "Превышена квота API (429). Подождите или смените модель/ключ."
+    if "402" in low or "insufficient" in low or "credit" in low or "too many tokens" in low:
+        return (
+            "Недостаточно кредитов OpenRouter (402). Пополните баланс на https://openrouter.ai/credits "
+            "или выберите бесплатную модель (/model)."
+        )
     if "503" in low or "500" in low or "unavailable" in low or "deadline" in low:
         return "Сервис Gemini временно недоступен. Повторите попытку чуть позже."
     if "not found" in low and "model" in low:
